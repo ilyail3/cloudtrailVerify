@@ -22,6 +22,7 @@ import (
 	"crypto"
 	"os"
 	"encoding/csv"
+	"sync"
 )
 
 const FilenameRegex = "\\/([0-9]{12})_CloudTrail-Digest_([a-z0-9-]+)_" +
@@ -34,11 +35,11 @@ const FileOpenMode = os.O_RDWR | os.O_TRUNC | os.O_CREATE
 const FilePermission = 0600
 
 type DigestCompare struct {
-	Objects *treeset.Set
-	minDates map[string]string
-	maxDates map[string]string
-	svc *s3.S3
-	cred *credentials.Credentials
+	Objects    map[ScanPartition]*treeset.Set
+	minDates   map[string]string
+	maxDates   map[string]string
+	svc        *s3.S3
+	cred       *credentials.Credentials
 	publicKeys map[string]*rsa.PublicKey
 }
 
@@ -59,34 +60,44 @@ type LogFile struct {
 }
 
 type DigestFile struct {
-	PreviousDigestS3Bucket      string  `json:"previousDigestS3Bucket"`
-	PreviousDigestS3Object      string  `json:"previousDigestS3Object"`
-	DigestSignatureAlgorithm    string  `json:"digestSignatureAlgorithm"`
-	PreviousDigestSignature     string  `json:"previousDigestSignature"`
-	PreviousDigestHashAlgorithm string  `json:"previousDigestHashAlgorithm"`
-	PreviousDigestHashValue     string  `json:"previousDigestHashValue"`
-	DigestPublicKeyFingerprint  string  `json:"digestPublicKeyFingerprint"`
-	DigestEndTime               string  `json:"digestEndTime"`
-	DigestS3Bucket              string  `json:"digestS3Bucket"`
-	DigestS3Object              string  `json:"digestS3Object"`
+	PreviousDigestS3Bucket      string    `json:"previousDigestS3Bucket"`
+	PreviousDigestS3Object      string    `json:"previousDigestS3Object"`
+	DigestSignatureAlgorithm    string    `json:"digestSignatureAlgorithm"`
+	PreviousDigestSignature     string    `json:"previousDigestSignature"`
+	PreviousDigestHashAlgorithm string    `json:"previousDigestHashAlgorithm"`
+	PreviousDigestHashValue     string    `json:"previousDigestHashValue"`
+	DigestPublicKeyFingerprint  string    `json:"digestPublicKeyFingerprint"`
+	DigestEndTime               string    `json:"digestEndTime"`
+	DigestS3Bucket              string    `json:"digestS3Bucket"`
+	DigestS3Object              string    `json:"digestS3Object"`
 	LogFiles                    []LogFile `json:"logFiles"`
+}
+
+type ScanPartition struct {
+	Account string
+	Region  string
+}
+
+type ValidateTask struct {
+	validate Validate
+	results  chan DigestFile
 }
 
 func NewDigestCompare(svc *s3.S3, cred *credentials.Credentials) *DigestCompare {
 	return &DigestCompare{
-		Objects: treeset.NewWithStringComparator(),
-		minDates: make(map[string]string),
-		maxDates: make(map[string]string),
+		Objects:    make(map[ScanPartition]*treeset.Set),
+		minDates:   make(map[string]string),
+		maxDates:   make(map[string]string),
 		publicKeys: make(map[string]*rsa.PublicKey),
-		svc: svc,
-		cred: cred,
+		svc:        svc,
+		cred:       cred,
 	}
 }
 
-func (result *DigestCompare)ListDigestFiles(bucket string, prefix string) error {
+func (result *DigestCompare) ListDigestFiles(bucket string, prefix string) error {
 	marker := ""
 
-	filenameRegex,err := regexp.Compile(FilenameRegex)
+	filenameRegex, err := regexp.Compile(FilenameRegex)
 
 	if err != nil {
 		return err
@@ -103,12 +114,23 @@ func (result *DigestCompare)ListDigestFiles(bucket string, prefix string) error 
 		}
 
 		for _, k := range resp.Contents {
-			result.Objects.Add(bucket + "/" + *k.Key)
-
 			parts := filenameRegex.FindStringSubmatch(*k.Key)
 
 			region := parts[2]
 			date := parts[5]
+
+			partition := ScanPartition{
+				Account: parts[1],
+				Region:  parts[2],
+			}
+
+			obj, exists := result.Objects[partition]
+			if !exists {
+				obj = treeset.NewWithStringComparator()
+				result.Objects[partition] = obj
+			}
+
+			obj.Add(bucket + "/" + *k.Key)
 
 			current, exists := result.minDates[region]
 
@@ -133,17 +155,17 @@ func (result *DigestCompare)ListDigestFiles(bucket string, prefix string) error 
 	return err
 }
 
-func (result *DigestCompare)GetPublicKeys() error {
+func (result *DigestCompare) GetPublicKeys() error {
 	for region, minDateStr := range result.minDates {
 		maxDateStr := result.maxDates[region]
 
-		minDate,err := time.Parse(FilenameDateFormat, minDateStr)
+		minDate, err := time.Parse(FilenameDateFormat, minDateStr)
 
 		if err != nil {
 			return err
 		}
 
-		maxDate,err := time.Parse(FilenameDateFormat, maxDateStr)
+		maxDate, err := time.Parse(FilenameDateFormat, maxDateStr)
 
 		if err != nil {
 			return err
@@ -162,7 +184,7 @@ func (result *DigestCompare)GetPublicKeys() error {
 
 		publicKeys, err := cloudtrailSvc.ListPublicKeys(&cloudtrail.ListPublicKeysInput{
 			StartTime: &minDate,
-			EndTime: &maxDate,
+			EndTime:   &maxDate,
 		})
 
 		if err != nil {
@@ -189,7 +211,7 @@ func streamToByte(stream io.Reader) []byte {
 	return buf.Bytes()
 }
 
-func(result *DigestCompare) verifySignature(keyFingerPrint string, hashed [32]byte, signature string) error {
+func (result *DigestCompare) verifySignature(keyFingerPrint string, hashed [32]byte, signature string) error {
 	signed, err := hex.DecodeString(signature)
 
 	if err != nil {
@@ -209,14 +231,53 @@ func(result *DigestCompare) verifySignature(keyFingerPrint string, hashed [32]by
 		signed)
 }
 
-func(result *DigestCompare) ValidateObjects() error {
+func (result *DigestCompare) ValidateObjects() error {
+
+	resultChannel := make(chan LogFile)
+	errors := make(chan error)
+	taskQueue := make(chan ValidateTask)
+
+	var wgWriter sync.WaitGroup
+	wgWriter.Add(1)
+
+	go result.writeFile(resultChannel, errors, wgWriter)
+	go result.processTask(taskQueue, errors)
+
+	var wgReader sync.WaitGroup
+	wgReader.Add(len(result.Objects))
+	for _, set := range result.Objects {
+		go result.validateObjects(set, resultChannel, taskQueue, errors, wgReader)
+	}
+
+	var err error = nil
+
+	go func() {
+		for localErr := range errors {
+			log.Printf("error:%v\n", localErr)
+			err = localErr
+		}
+	}()
+
+	wgReader.Wait()
+	close(resultChannel)
+
+	wgWriter.Wait()
+	close(errors)
+
+	return err
+}
+
+func (result *DigestCompare) writeFile(results <-chan LogFile, errors chan error, wg sync.WaitGroup) {
+	defer wg.Done()
+
 	fileWriter, err := os.OpenFile(
 		"/tmp/files.csv",
 		FileOpenMode,
 		FilePermission)
 
 	if err != nil {
-		return err
+		errors <- err
+		return
 	}
 
 	defer fileWriter.Close()
@@ -233,25 +294,26 @@ func(result *DigestCompare) ValidateObjects() error {
 		"OldestEventTime",
 	})
 
-	for !result.Objects.Empty() {
-		it := result.Objects.Iterator()
-		it.End()
-		it.Prev()
+	for file := range results {
+		writer.Write([]string{
+			file.S3Bucket,
+			file.S3Object,
+			file.HashValue,
+			file.HashAlgorithm,
+			file.NewestEventTime,
+			file.OldestEventTime,
+		})
+	}
+}
 
-		lastKey := it.Value().(string)
-		parts := strings.SplitN(lastKey, "/", 2)
+func (result *DigestCompare) processTask(taskQueue chan ValidateTask, errors chan error) {
+	for task := range taskQueue {
+		validate := task.validate
 
-		v := Validate{
-			Bucket: parts[0],
-			Key: parts[1],
-			ExpectedSig: "",
-			ExpectedHash: "",
-		}
-
-		for result.Objects.Contains(v.Bucket + "/" + v.Key) {
+		for {
 			f, err := result.svc.GetObject(&s3.GetObjectInput{
-				Bucket: &v.Bucket,
-				Key:    &v.Key})
+				Bucket: &validate.Bucket,
+				Key:    &validate.Key})
 
 			if err != nil {
 				data := err.(s3.RequestFailure)
@@ -259,14 +321,17 @@ func(result *DigestCompare) ValidateObjects() error {
 				// in such case, just ignore the record, this doesn't break the chain(since those files
 				// are truncated by age, therefor oldest-last links of the chain will be impacted first)
 				if data.Code() == "NoSuchKey" {
-					result.Objects.Remove(v.Bucket + "/" + v.Key)
+					close(task.results)
 					break
 				} else {
-					return fmt.Errorf(
+					errors <- fmt.Errorf(
 						"error getting key bucket:%s key:%s error:%v",
-						v.Bucket,
-						v.Key,
+						validate.Bucket,
+						validate.Key,
 						err)
+
+					close(task.results)
+					break
 				}
 			}
 
@@ -275,21 +340,27 @@ func(result *DigestCompare) ValidateObjects() error {
 
 			decoder := json.NewDecoder(bytes.NewReader(data))
 
-			file := &DigestFile{}
-			decoder.Decode(file)
+			file := DigestFile{}
+			decoder.Decode(&file)
 
 			hashed := sha256.Sum256(data)
 			calculatedHash := hex.EncodeToString(hashed[:])
 
-			if v.ExpectedHash != "" && calculatedHash != v.ExpectedHash {
-				return fmt.Errorf(
+			if validate.ExpectedHash != "" && calculatedHash != validate.ExpectedHash {
+				errors <- fmt.Errorf(
 					"bad hash encountered on key:%s, expected:%s, got:%s",
-					v.Key,
+					validate.Key,
 					calculatedHash,
-					v.ExpectedHash)
+					validate.ExpectedHash)
+
+				close(task.results)
+				break
 			}
 			if *f.Metadata["Signature-Algorithm"] != "SHA256withRSA" {
-				return fmt.Errorf("unkown signature algorithem encountered:%s", *f.Metadata["Signature-Algorithm"])
+				errors <- fmt.Errorf("unkown signature algorithem encountered:%s", *f.Metadata["Signature-Algorithm"])
+
+				close(task.results)
+				break
 			}
 
 			dataToSign := fmt.Sprintf("%s\n%s/%s\n%s\n%s",
@@ -304,35 +375,58 @@ func(result *DigestCompare) ValidateObjects() error {
 			err = result.verifySignature(file.DigestPublicKeyFingerprint, signatureHash, *f.Metadata["Signature"])
 
 			if err != nil {
-				return fmt.Errorf(
+				errors <- fmt.Errorf(
 					"failed to validate bucket:%s key:%s signature:%v",
-					v.Bucket,
-					v.Key,
+					validate.Bucket,
+					validate.Key,
 					err)
+
+				close(task.results)
+				return
 			}
 
-			result.Objects.Remove(v.Bucket + "/" + v.Key)
+			fmt.Printf("Verified object %s/%s\n", validate.Bucket, validate.Key)
+			task.results <- file
 
-			fmt.Printf("Verified object %s/%s\n", v.Bucket, v.Key)
-
-			v.Bucket = file.PreviousDigestS3Bucket
-			v.Key = file.PreviousDigestS3Object
-			v.ExpectedSig = file.PreviousDigestSignature
-			v.ExpectedHash = file.PreviousDigestHashValue
-
-			for _, file := range file.LogFiles {
-				writer.Write([]string{
-					file.S3Bucket,
-					file.S3Object,
-					file.HashValue,
-					file.HashAlgorithm,
-					file.NewestEventTime,
-					file.OldestEventTime,
-				})
+			validate = Validate{
+				Bucket:       file.PreviousDigestS3Bucket,
+				Key:          file.PreviousDigestS3Object,
+				ExpectedSig:  file.PreviousDigestSignature,
+				ExpectedHash: file.PreviousDigestHashValue,
 			}
 		}
-
 	}
+}
 
-	return nil
+func (result *DigestCompare) validateObjects(set *treeset.Set, results chan LogFile, taskQueue chan ValidateTask, errors chan error, wg sync.WaitGroup) {
+	defer wg.Done()
+
+	for !set.Empty() {
+		it := set.Iterator()
+		it.End()
+		it.Prev()
+
+		lastKey := it.Value().(string)
+		parts := strings.SplitN(lastKey, "/", 2)
+
+		digestResult := make(chan DigestFile)
+
+		taskQueue <- ValidateTask{
+			validate: Validate{
+				Bucket:       parts[0],
+				Key:          parts[1],
+				ExpectedSig:  "",
+				ExpectedHash: "",
+			},
+			results: digestResult,
+		}
+
+		for digestFile := range digestResult {
+			for _, logFile := range digestFile.LogFiles {
+				results <- logFile
+			}
+
+			set.Remove(digestFile.DigestS3Bucket + "/" + digestFile.DigestS3Object)
+		}
+	}
 }
