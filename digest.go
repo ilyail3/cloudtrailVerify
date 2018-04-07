@@ -35,7 +35,6 @@ const FileOpenMode = os.O_RDWR | os.O_TRUNC | os.O_CREATE
 const FilePermission = 0600
 
 type DigestCompare struct {
-	Objects    map[ScanPartition]*treeset.Set
 	minDates   map[string]string
 	maxDates   map[string]string
 	svc        *s3.S3
@@ -79,14 +78,8 @@ type DigestFile struct {
 	LogFiles                    []LogFile `json:"logFiles"`
 }
 
-type ScanPartition struct {
-	Account string
-	Region  string
-}
-
 func NewDigestCompare(svc *s3.S3, cred *credentials.Credentials) *DigestCompare {
 	return &DigestCompare{
-		Objects:    make(map[ScanPartition]*treeset.Set),
 		minDates:   make(map[string]string),
 		maxDates:   make(map[string]string),
 		publicKeys: make(map[string]*rsa.PublicKey),
@@ -97,6 +90,20 @@ func NewDigestCompare(svc *s3.S3, cred *credentials.Credentials) *DigestCompare 
 
 func (result *DigestCompare) ListDigestFiles(bucket string, prefix string) error {
 	marker := ""
+
+	fileAccount := ""
+	fileRegion := ""
+
+	var fileWriter io.WriteCloser = nil
+	var csvWriter *csv.Writer = nil
+
+	// Close everything(if anything is open)
+	defer func() {
+		if fileWriter != nil {
+			csvWriter.Flush()
+			fileWriter.Close()
+		}
+	}()
 
 	filenameRegex, err := regexp.Compile(FilenameRegex)
 
@@ -117,21 +124,42 @@ func (result *DigestCompare) ListDigestFiles(bucket string, prefix string) error
 		for _, k := range resp.Contents {
 			parts := filenameRegex.FindStringSubmatch(*k.Key)
 
+			account := parts[1]
 			region := parts[2]
 			date := parts[5]
 
-			partition := ScanPartition{
-				Account: parts[1],
-				Region:  parts[2],
+			if region != fileRegion || account != fileAccount {
+				fileRegion = region
+				fileAccount = account
+
+				if fileWriter != nil {
+					csvWriter.Flush()
+					fileWriter.Close()
+				}
+
+				directory := fmt.Sprintf("/tmp/list/%s", fileAccount)
+				err := os.MkdirAll(directory, 0700)
+
+				if err != nil {
+					return err
+				}
+
+				fileWriter, err = os.OpenFile(
+					fmt.Sprintf("%s/%s.csv", directory, fileRegion),
+					FileOpenMode,
+					FilePermission)
+
+				if err != nil {
+					return err
+				}
+
+				csvWriter = csv.NewWriter(fileWriter)
 			}
 
-			obj, exists := result.Objects[partition]
-			if !exists {
-				obj = treeset.NewWithStringComparator()
-				result.Objects[partition] = obj
-			}
-
-			obj.Add(bucket + "/" + *k.Key)
+			csvWriter.Write([]string{
+				bucket,
+				*k.Key,
+			})
 
 			current, exists := result.minDates[region]
 
@@ -451,10 +479,10 @@ func (result *DigestCompare) ValidateObjects() error {
 
 	var scanWaiter sync.WaitGroup
 
-	for _, set := range result.Objects {
+	/*for _, set := range result.Objects {
 		scanWaiter.Add(1)
 		go result.processSet(set, resultChannel, failedChannel, errorChannel, &scanWaiter)
-	}
+	}*/
 
 	// Close the resultChannel when all scans die
 	go func() {

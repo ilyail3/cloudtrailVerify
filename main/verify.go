@@ -10,6 +10,7 @@ import (
 	"github.com/ilyail3/cloudtrailVerify"
 	"os"
 	"strings"
+	"sync"
 )
 
 func main() {
@@ -48,16 +49,26 @@ func main() {
 			log.Panicf("failed to get list:%v", err)
 		}
 
+		var wg sync.WaitGroup
+
 		for _, commonPrefix := range objects.CommonPrefixes {
 			prefix := *commonPrefix.Prefix + "CloudTrail-Digest"
-			err = c.ListDigestFiles(os.Args[2], prefix)
 
-			if err != nil {
-				log.Panicf("failed to get tree for:%s error:%v", prefix, err)
-			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
 
-			log.Printf("Read tree for:%s\n", prefix)
+				err = c.ListDigestFiles(os.Args[2], prefix)
+
+				if err != nil {
+					log.Printf("failed to get tree for:%s error:%v\n", prefix, err)
+				}
+
+				log.Printf("Read tree for:%s\n", prefix)
+			}()
 		}
+
+		wg.Wait()
 	} else if strings.HasSuffix(os.Args[3], "/CloudTrail-Digest") {
 		err = c.ListDigestFiles(os.Args[2], os.Args[3]+"/")
 
@@ -74,11 +85,11 @@ func main() {
 		log.Panicf("failed to get public keys:%v", err)
 	}
 
-	err = c.ValidateObjects()
+	/*err = c.ValidateObjects()
 
 	if err != nil {
 		log.Panicf("validate object:%v", err)
-	}
+	}*/
 
 	/*err = validate(Validate{
 		Bucket: BUCKET,
