@@ -34,7 +34,7 @@ const FileOpenMode = os.O_RDWR | os.O_TRUNC | os.O_CREATE
 const FilePermission = 0600
 
 type DigestCompare struct {
-	Objects *treeset.Set
+	Objects map[ScanPartition]*treeset.Set
 	minDates map[string]string
 	maxDates map[string]string
 	svc *s3.S3
@@ -72,9 +72,14 @@ type DigestFile struct {
 	LogFiles                    []LogFile `json:"logFiles"`
 }
 
+type ScanPartition struct {
+	Account string
+	Region string
+}
+
 func NewDigestCompare(svc *s3.S3, cred *credentials.Credentials) *DigestCompare {
 	return &DigestCompare{
-		Objects: treeset.NewWithStringComparator(),
+		Objects: make(map[ScanPartition]*treeset.Set),
 		minDates: make(map[string]string),
 		maxDates: make(map[string]string),
 		publicKeys: make(map[string]*rsa.PublicKey),
@@ -103,12 +108,23 @@ func (result *DigestCompare)ListDigestFiles(bucket string, prefix string) error 
 		}
 
 		for _, k := range resp.Contents {
-			result.Objects.Add(bucket + "/" + *k.Key)
-
 			parts := filenameRegex.FindStringSubmatch(*k.Key)
 
 			region := parts[2]
 			date := parts[5]
+
+			partition := ScanPartition{
+				Account: parts[1],
+				Region: parts[2],
+			}
+
+			obj, exists := result.Objects[partition]
+			if !exists {
+				obj = treeset.NewWithStringComparator()
+				result.Objects[partition] = obj
+			}
+
+			obj.Add(bucket + "/" + *k.Key)
 
 			current, exists := result.minDates[region]
 
@@ -233,105 +249,107 @@ func(result *DigestCompare) ValidateObjects() error {
 		"OldestEventTime",
 	})
 
-	for !result.Objects.Empty() {
-		it := result.Objects.Iterator()
-		it.End()
-		it.Prev()
+	for _, set := range result.Objects {
+		for !set.Empty() {
+			it := set.Iterator()
+			it.End()
+			it.Prev()
 
-		lastKey := it.Value().(string)
-		parts := strings.SplitN(lastKey, "/", 2)
+			lastKey := it.Value().(string)
+			parts := strings.SplitN(lastKey, "/", 2)
 
-		v := Validate{
-			Bucket: parts[0],
-			Key: parts[1],
-			ExpectedSig: "",
-			ExpectedHash: "",
-		}
+			v := Validate{
+				Bucket: parts[0],
+				Key: parts[1],
+				ExpectedSig: "",
+				ExpectedHash: "",
+			}
 
-		for result.Objects.Contains(v.Bucket + "/" + v.Key) {
-			f, err := result.svc.GetObject(&s3.GetObjectInput{
-				Bucket: &v.Bucket,
-				Key:    &v.Key})
+			for set.Contains(v.Bucket + "/" + v.Key) {
+				f, err := result.svc.GetObject(&s3.GetObjectInput{
+					Bucket: &v.Bucket,
+					Key:    &v.Key})
 
-			if err != nil {
-				data := err.(s3.RequestFailure)
-				// Objects can be deleted by AWS while the process is running.
-				// in such case, just ignore the record, this doesn't break the chain(since those files
-				// are truncated by age, therefor oldest-last links of the chain will be impacted first)
-				if data.Code() == "NoSuchKey" {
-					result.Objects.Remove(v.Bucket + "/" + v.Key)
-					break
-				} else {
+				if err != nil {
+					data := err.(s3.RequestFailure)
+					// Objects can be deleted by AWS while the process is running.
+					// in such case, just ignore the record, this doesn't break the chain(since those files
+					// are truncated by age, therefor oldest-last links of the chain will be impacted first)
+					if data.Code() == "NoSuchKey" {
+						set.Remove(v.Bucket + "/" + v.Key)
+						break
+					} else {
+						return fmt.Errorf(
+							"error getting key bucket:%s key:%s error:%v",
+							v.Bucket,
+							v.Key,
+							err)
+					}
+				}
+
+				data := streamToByte(f.Body)
+				f.Body.Close()
+
+				decoder := json.NewDecoder(bytes.NewReader(data))
+
+				file := &DigestFile{}
+				decoder.Decode(file)
+
+				hashed := sha256.Sum256(data)
+				calculatedHash := hex.EncodeToString(hashed[:])
+
+				if v.ExpectedHash != "" && calculatedHash != v.ExpectedHash {
 					return fmt.Errorf(
-						"error getting key bucket:%s key:%s error:%v",
+						"bad hash encountered on key:%s, expected:%s, got:%s",
+						v.Key,
+						calculatedHash,
+						v.ExpectedHash)
+				}
+				if *f.Metadata["Signature-Algorithm"] != "SHA256withRSA" {
+					return fmt.Errorf("unkown signature algorithem encountered:%s", *f.Metadata["Signature-Algorithm"])
+				}
+
+				dataToSign := fmt.Sprintf("%s\n%s/%s\n%s\n%s",
+					file.DigestEndTime,
+					file.DigestS3Bucket,
+					file.DigestS3Object,
+					hex.EncodeToString(hashed[:]),
+					file.PreviousDigestSignature)
+
+				signatureHash := sha256.Sum256([]byte(dataToSign))
+
+				err = result.verifySignature(file.DigestPublicKeyFingerprint, signatureHash, *f.Metadata["Signature"])
+
+				if err != nil {
+					return fmt.Errorf(
+						"failed to validate bucket:%s key:%s signature:%v",
 						v.Bucket,
 						v.Key,
 						err)
 				}
+
+				set.Remove(v.Bucket + "/" + v.Key)
+
+				fmt.Printf("Verified object %s/%s\n", v.Bucket, v.Key)
+
+				v.Bucket = file.PreviousDigestS3Bucket
+				v.Key = file.PreviousDigestS3Object
+				v.ExpectedSig = file.PreviousDigestSignature
+				v.ExpectedHash = file.PreviousDigestHashValue
+
+				for _, file := range file.LogFiles {
+					writer.Write([]string{
+						file.S3Bucket,
+						file.S3Object,
+						file.HashValue,
+						file.HashAlgorithm,
+						file.NewestEventTime,
+						file.OldestEventTime,
+					})
+				}
 			}
 
-			data := streamToByte(f.Body)
-			f.Body.Close()
-
-			decoder := json.NewDecoder(bytes.NewReader(data))
-
-			file := &DigestFile{}
-			decoder.Decode(file)
-
-			hashed := sha256.Sum256(data)
-			calculatedHash := hex.EncodeToString(hashed[:])
-
-			if v.ExpectedHash != "" && calculatedHash != v.ExpectedHash {
-				return fmt.Errorf(
-					"bad hash encountered on key:%s, expected:%s, got:%s",
-					v.Key,
-					calculatedHash,
-					v.ExpectedHash)
-			}
-			if *f.Metadata["Signature-Algorithm"] != "SHA256withRSA" {
-				return fmt.Errorf("unkown signature algorithem encountered:%s", *f.Metadata["Signature-Algorithm"])
-			}
-
-			dataToSign := fmt.Sprintf("%s\n%s/%s\n%s\n%s",
-				file.DigestEndTime,
-				file.DigestS3Bucket,
-				file.DigestS3Object,
-				hex.EncodeToString(hashed[:]),
-				file.PreviousDigestSignature)
-
-			signatureHash := sha256.Sum256([]byte(dataToSign))
-
-			err = result.verifySignature(file.DigestPublicKeyFingerprint, signatureHash, *f.Metadata["Signature"])
-
-			if err != nil {
-				return fmt.Errorf(
-					"failed to validate bucket:%s key:%s signature:%v",
-					v.Bucket,
-					v.Key,
-					err)
-			}
-
-			result.Objects.Remove(v.Bucket + "/" + v.Key)
-
-			fmt.Printf("Verified object %s/%s\n", v.Bucket, v.Key)
-
-			v.Bucket = file.PreviousDigestS3Bucket
-			v.Key = file.PreviousDigestS3Object
-			v.ExpectedSig = file.PreviousDigestSignature
-			v.ExpectedHash = file.PreviousDigestHashValue
-
-			for _, file := range file.LogFiles {
-				writer.Write([]string{
-					file.S3Bucket,
-					file.S3Object,
-					file.HashValue,
-					file.HashAlgorithm,
-					file.NewestEventTime,
-					file.OldestEventTime,
-				})
-			}
 		}
-
 	}
 
 	return nil
