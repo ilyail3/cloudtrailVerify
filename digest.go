@@ -35,11 +35,11 @@ const FileOpenMode = os.O_RDWR | os.O_TRUNC | os.O_CREATE
 const FilePermission = 0600
 
 type DigestCompare struct {
-	Objects map[ScanPartition]*treeset.Set
-	minDates map[string]string
-	maxDates map[string]string
-	svc *s3.S3
-	cred *credentials.Credentials
+	Objects    map[ScanPartition]*treeset.Set
+	minDates   map[string]string
+	maxDates   map[string]string
+	svc        *s3.S3
+	cred       *credentials.Credentials
 	publicKeys map[string]*rsa.PublicKey
 }
 
@@ -48,6 +48,12 @@ type Validate struct {
 	Key          string
 	ExpectedSig  string
 	ExpectedHash string
+}
+
+type ValidationFailed struct {
+	Bucket string
+	Key    string
+	Error  error
 }
 
 type LogFile struct {
@@ -60,39 +66,39 @@ type LogFile struct {
 }
 
 type DigestFile struct {
-	PreviousDigestS3Bucket      string  `json:"previousDigestS3Bucket"`
-	PreviousDigestS3Object      string  `json:"previousDigestS3Object"`
-	DigestSignatureAlgorithm    string  `json:"digestSignatureAlgorithm"`
-	PreviousDigestSignature     string  `json:"previousDigestSignature"`
-	PreviousDigestHashAlgorithm string  `json:"previousDigestHashAlgorithm"`
-	PreviousDigestHashValue     string  `json:"previousDigestHashValue"`
-	DigestPublicKeyFingerprint  string  `json:"digestPublicKeyFingerprint"`
-	DigestEndTime               string  `json:"digestEndTime"`
-	DigestS3Bucket              string  `json:"digestS3Bucket"`
-	DigestS3Object              string  `json:"digestS3Object"`
+	PreviousDigestS3Bucket      string    `json:"previousDigestS3Bucket"`
+	PreviousDigestS3Object      string    `json:"previousDigestS3Object"`
+	DigestSignatureAlgorithm    string    `json:"digestSignatureAlgorithm"`
+	PreviousDigestSignature     string    `json:"previousDigestSignature"`
+	PreviousDigestHashAlgorithm string    `json:"previousDigestHashAlgorithm"`
+	PreviousDigestHashValue     string    `json:"previousDigestHashValue"`
+	DigestPublicKeyFingerprint  string    `json:"digestPublicKeyFingerprint"`
+	DigestEndTime               string    `json:"digestEndTime"`
+	DigestS3Bucket              string    `json:"digestS3Bucket"`
+	DigestS3Object              string    `json:"digestS3Object"`
 	LogFiles                    []LogFile `json:"logFiles"`
 }
 
 type ScanPartition struct {
 	Account string
-	Region string
+	Region  string
 }
 
 func NewDigestCompare(svc *s3.S3, cred *credentials.Credentials) *DigestCompare {
 	return &DigestCompare{
-		Objects: make(map[ScanPartition]*treeset.Set),
-		minDates: make(map[string]string),
-		maxDates: make(map[string]string),
+		Objects:    make(map[ScanPartition]*treeset.Set),
+		minDates:   make(map[string]string),
+		maxDates:   make(map[string]string),
 		publicKeys: make(map[string]*rsa.PublicKey),
-		svc: svc,
-		cred: cred,
+		svc:        svc,
+		cred:       cred,
 	}
 }
 
-func (result *DigestCompare)ListDigestFiles(bucket string, prefix string) error {
+func (result *DigestCompare) ListDigestFiles(bucket string, prefix string) error {
 	marker := ""
 
-	filenameRegex,err := regexp.Compile(FilenameRegex)
+	filenameRegex, err := regexp.Compile(FilenameRegex)
 
 	if err != nil {
 		return err
@@ -116,7 +122,7 @@ func (result *DigestCompare)ListDigestFiles(bucket string, prefix string) error 
 
 			partition := ScanPartition{
 				Account: parts[1],
-				Region: parts[2],
+				Region:  parts[2],
 			}
 
 			obj, exists := result.Objects[partition]
@@ -150,17 +156,17 @@ func (result *DigestCompare)ListDigestFiles(bucket string, prefix string) error 
 	return err
 }
 
-func (result *DigestCompare)GetPublicKeys() error {
+func (result *DigestCompare) GetPublicKeys() error {
 	for region, minDateStr := range result.minDates {
 		maxDateStr := result.maxDates[region]
 
-		minDate,err := time.Parse(FilenameDateFormat, minDateStr)
+		minDate, err := time.Parse(FilenameDateFormat, minDateStr)
 
 		if err != nil {
 			return err
 		}
 
-		maxDate,err := time.Parse(FilenameDateFormat, maxDateStr)
+		maxDate, err := time.Parse(FilenameDateFormat, maxDateStr)
 
 		if err != nil {
 			return err
@@ -177,9 +183,18 @@ func (result *DigestCompare)GetPublicKeys() error {
 
 		cloudtrailSvc := cloudtrail.New(awsSession)
 
+		bounds, err := time.ParseDuration("900h")
+
+		if err != nil {
+			return fmt.Errorf("failed to parse date bounds %v", err)
+		}
+
+		maxDate = maxDate.Add(bounds)
+		minDate = minDate.Add(bounds * -1)
+
 		publicKeys, err := cloudtrailSvc.ListPublicKeys(&cloudtrail.ListPublicKeysInput{
 			StartTime: &minDate,
-			EndTime: &maxDate,
+			EndTime:   &maxDate,
 		})
 
 		if err != nil {
@@ -206,7 +221,7 @@ func streamToByte(stream io.Reader) []byte {
 	return buf.Bytes()
 }
 
-func(result *DigestCompare) verifySignature(keyFingerPrint string, hashed [32]byte, signature string) error {
+func (result *DigestCompare) verifySignature(keyFingerPrint string, hashed [32]byte, signature string) error {
 	signed, err := hex.DecodeString(signature)
 
 	if err != nil {
@@ -226,7 +241,7 @@ func(result *DigestCompare) verifySignature(keyFingerPrint string, hashed [32]by
 		signed)
 }
 
-func(result *DigestCompare) writer(resultChannel <-chan LogFile, errChannel chan error, wait *sync.WaitGroup){
+func (result *DigestCompare) writer(resultChannel <-chan LogFile, errChannel chan error, wait *sync.WaitGroup) {
 	defer wait.Done()
 
 	fileWriter, err := os.OpenFile(
@@ -265,7 +280,46 @@ func(result *DigestCompare) writer(resultChannel <-chan LogFile, errChannel chan
 	}
 }
 
-func(result *DigestCompare) processSet(set *treeset.Set, resultChannel chan LogFile, errChannel chan error, waitGroup *sync.WaitGroup) {
+func (result *DigestCompare) failed(resultChannel <-chan ValidationFailed, errChannel chan error, wait *sync.WaitGroup) {
+	defer wait.Done()
+
+	fileWriter, err := os.OpenFile(
+		"/tmp/failed.csv",
+		FileOpenMode,
+		FilePermission)
+
+	if err != nil {
+		errChannel <- err
+		return
+	}
+
+	defer fileWriter.Close()
+
+	writer := csv.NewWriter(fileWriter)
+	defer writer.Flush()
+
+	writer.Write([]string{
+		"S3Bucket",
+		"S3Object",
+		"Error",
+	})
+
+	for failedFile := range resultChannel {
+		writer.Write([]string{
+			failedFile.Bucket,
+			failedFile.Key,
+			fmt.Sprintf("%v", failedFile.Error),
+		})
+	}
+}
+
+func (result *DigestCompare) processSet(
+	set *treeset.Set,
+	resultChannel chan LogFile,
+	failedChannel chan ValidationFailed,
+	errChannel chan error,
+	waitGroup *sync.WaitGroup) {
+
 	defer waitGroup.Done()
 
 	for !set.Empty() {
@@ -277,9 +331,9 @@ func(result *DigestCompare) processSet(set *treeset.Set, resultChannel chan LogF
 		parts := strings.SplitN(lastKey, "/", 2)
 
 		v := Validate{
-			Bucket: parts[0],
-			Key: parts[1],
-			ExpectedSig: "",
+			Bucket:       parts[0],
+			Key:          parts[1],
+			ExpectedSig:  "",
 			ExpectedHash: "",
 		}
 
@@ -346,13 +400,24 @@ func(result *DigestCompare) processSet(set *treeset.Set, resultChannel chan LogF
 			err = result.verifySignature(file.DigestPublicKeyFingerprint, signatureHash, *f.Metadata["Signature"])
 
 			if err != nil {
-				errChannel <- fmt.Errorf(
-					"failed to validate bucket:%s key:%s signature:%v",
+				/*errChannel <- fmt.Errorf(
+					"failed to validate bucket:%s key:%s fingerprint:%s error:%v",
 					v.Bucket,
 					v.Key,
+					file.DigestPublicKeyFingerprint,
 					err)
 
-				return
+				return*/
+				failedChannel <- ValidationFailed{
+					Bucket: v.Bucket,
+					Key:    v.Key,
+					Error:  err,
+				}
+
+				log.Printf("Can't verified object %s/%s\n", v.Bucket, v.Key)
+				// Don't crawl up a chain you can't validate
+				set.Remove(v.Bucket + "/" + v.Key)
+				break
 			}
 
 			set.Remove(v.Bucket + "/" + v.Key)
@@ -372,8 +437,9 @@ func(result *DigestCompare) processSet(set *treeset.Set, resultChannel chan LogF
 	}
 }
 
-func(result *DigestCompare) ValidateObjects() error {
+func (result *DigestCompare) ValidateObjects() error {
 	resultChannel := make(chan LogFile)
+	failedChannel := make(chan ValidationFailed)
 	errorChannel := make(chan error)
 
 	var writerWait sync.WaitGroup
@@ -381,23 +447,26 @@ func(result *DigestCompare) ValidateObjects() error {
 	writerWait.Add(1)
 	go result.writer(resultChannel, errorChannel, &writerWait)
 
+	writerWait.Add(1)
+	go result.failed(failedChannel, errorChannel, &writerWait)
+
 	var scanWaiter sync.WaitGroup
-	for p, set := range result.Objects {
-		if p.Region != "ap-northeast-3" && p.Region != "ap-northeast-2" {
-			scanWaiter.Add(1)
-			go result.processSet(set, resultChannel, errorChannel, &scanWaiter)
-		}
+
+	for _, set := range result.Objects {
+		scanWaiter.Add(1)
+		go result.processSet(set, resultChannel, failedChannel, errorChannel, &scanWaiter)
 	}
 
 	// Close the resultChannel when all scans die
-	go func(){
+	go func() {
 		scanWaiter.Wait()
 		log.Println("Scan waiter done")
 		close(resultChannel)
+		close(failedChannel)
 		log.Println("Results closed")
 	}()
 
-	go func(){
+	go func() {
 		writerWait.Wait()
 		log.Println("Writer waiter done")
 		close(errorChannel)
