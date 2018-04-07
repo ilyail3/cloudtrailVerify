@@ -9,6 +9,7 @@ import (
 	"os/user"
 	"github.com/ilyail3/cloudtrailVerify"
 	"os"
+	"strings"
 )
 
 func main() {
@@ -34,13 +35,37 @@ func main() {
 		log.Panicf("failed to parse minDate:%v", err)
 	}
 
-
 	c := cloudtrailVerify.NewDigestCompare(svc, cred)
 
-	err = c.ListDigestFiles(os.Args[2], os.Args[3])
+	if os.Args[3] == "AWSLogs" || strings.HasSuffix(os.Args[3], "/AWSLogs") {
+		objects, err := svc.ListObjects(&s3.ListObjectsInput{
+			Bucket:    aws.String(os.Args[2]),
+			Prefix:    aws.String(os.Args[3] + "/"),
+			Delimiter: aws.String("/"),
+		})
 
-	if err != nil {
-		log.Panicf("failed to get tree:%v", err)
+		if err != nil {
+			log.Panicf("failed to get list:%v", err)
+		}
+
+		for _, commonPrefix := range objects.CommonPrefixes {
+			prefix := *commonPrefix.Prefix + "CloudTrail-Digest"
+			err = c.ListDigestFiles(os.Args[2], prefix)
+
+			if err != nil {
+				log.Panicf("failed to get tree for:%s error:%v", prefix, err)
+			}
+
+			log.Printf("Read tree for:%s\n", prefix)
+		}
+	} else if strings.HasSuffix(os.Args[3], "/CloudTrail-Digest") {
+		err = c.ListDigestFiles(os.Args[2], os.Args[3]+"/")
+
+		if err != nil {
+			log.Panicf("failed to get tree:%v", err)
+		}
+	} else {
+		log.Panicf("bad location argument:%s", os.Args[3])
 	}
 
 	err = c.GetPublicKeys()
@@ -54,7 +79,6 @@ func main() {
 	if err != nil {
 		log.Panicf("validate object:%v", err)
 	}
-
 
 	/*err = validate(Validate{
 		Bucket: BUCKET,

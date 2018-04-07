@@ -373,14 +373,21 @@ func (result *DigestCompare) processSet(
 			calculatedHash := hex.EncodeToString(hashed[:])
 
 			if v.ExpectedHash != "" && calculatedHash != v.ExpectedHash {
-				errChannel <- fmt.Errorf(
-					"bad hash encountered on key:%s, expected:%s, got:%s",
-					v.Key,
-					calculatedHash,
-					v.ExpectedHash)
 
-				return
+				failedChannel <- ValidationFailed{
+					Bucket: v.Bucket,
+					Key:    v.Key,
+					Error: fmt.Errorf("bad hash encountered, expected:%s got:%s",
+						v.ExpectedHash,
+						calculatedHash),
+				}
+
+				log.Printf("Can't verified object %s/%s\n", v.Bucket, v.Key)
+				// Don't crawl up a chain you can't validate
+				set.Remove(v.Bucket + "/" + v.Key)
+				break
 			}
+
 			if *f.Metadata["Signature-Algorithm"] != "SHA256withRSA" {
 				errChannel <- fmt.Errorf("unkown signature algorithem encountered:%s",
 					*f.Metadata["Signature-Algorithm"])
@@ -400,14 +407,6 @@ func (result *DigestCompare) processSet(
 			err = result.verifySignature(file.DigestPublicKeyFingerprint, signatureHash, *f.Metadata["Signature"])
 
 			if err != nil {
-				/*errChannel <- fmt.Errorf(
-					"failed to validate bucket:%s key:%s fingerprint:%s error:%v",
-					v.Bucket,
-					v.Key,
-					file.DigestPublicKeyFingerprint,
-					err)
-
-				return*/
 				failedChannel <- ValidationFailed{
 					Bucket: v.Bucket,
 					Key:    v.Key,
